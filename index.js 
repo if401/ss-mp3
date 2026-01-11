@@ -1,0 +1,426 @@
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
+const play = require('play-dl');
+const { token } = require('./config.json');
+
+play.setToken({
+    youtube: {
+        cookie: 'YOUR_YOUTUBE_COOKIE' // 선택사항
+    }
+});
+
+// 환경 변수 우선, 없으면 로컬 config.json 사용
+const config = {
+    token: process.env.TOKEN || process.env.DISCORD_TOKEN,
+    clientId: process.env.CLIENT_ID
+};
+
+// config.json이 있으면 병합 (로컬 개발용)
+try {
+    const localConfig = require('./config.json');
+    Object.assign(config, { 
+        token: config.token || localConfig.token,
+        clientId: config.clientId || localConfig.clientId 
+    });
+} catch (err) {
+    // config.json이 없어도 환경 변수로 작동
+}
+
+if (!config.token) {
+    console.error('토큰이 설정되지 않았습니다!');
+    process.exit(1);
+}
+
+client.login(config.token);
+
+// 클라이언트 초기화
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+});
+
+// 서버별 큐 시스템 (여러 서버에서 동시 사용 가능)
+const queues = new Map();
+
+// 큐 구조: { connection, player, songs: [], isPlaying, textChannel }
+class Queue {
+    constructor() {
+        this.connection = null;
+        this.player = createAudioPlayer();
+        this.songs = [];
+        this.isPlaying = false;
+        this.textChannel = null;
+        this.currentSong = null;
+    }
+}
+
+client.once('ready', () => {
+    console.log(`${client.user.tag} 봇이 온라인입니다!`);
+});
+
+client.on('messageCreate', async message => {
+    if (message.author.bot) return;
+    
+    const serverQueue = queues.get(message.guild.id);
+    
+    // /재생 명령어
+    if (message.content.startsWith('/재생')) {
+        await execute(message, serverQueue);
+        return;
+    }
+    
+    // /추가 명령어
+    if (message.content.startsWith('/추가')) {
+        await addToQueue(message, serverQueue);
+        return;
+    }
+    
+    // /스킵 명령어
+    if (message.content.startsWith('/스킵')) {
+        await skip(message, serverQueue);
+        return;
+    }
+    
+    // /목록 명령어
+    if (message.content.startsWith('/목록')) {
+        await showQueue(message, serverQueue);
+        return;
+    }
+    
+    // /현재 명령어
+    if (message.content.startsWith('/현재')) {
+        await nowPlaying(message, serverQueue);
+        return;
+    }
+});
+
+// 재생 함수
+async function execute(message, serverQueue) {
+    const args = message.content.split(' ');
+    
+    // 음성 채널 확인
+    const voiceChannel = message.member.voice.channel;
+    if (!voiceChannel) {
+        return message.reply('음성 채널에 먼저 입장해주세요!');
+    }
+    
+    // 검색어 확인
+    if (args.length < 2) {
+        return message.reply('검색어를 입력해주세요! 예: /재생 노래제목');
+    }
+    
+    const searchQuery = args.slice(1).join(' ');
+    
+    try {
+        // play-dl을 사용한 유튜브 검색 (고음질 우선)
+        const searchResult = await play.search(searchQuery, { limit: 1, source: { youtube: "video" } });
+        
+        if (!searchResult || searchResult.length === 0) {
+            return message.reply('검색 결과를 찾을 수 없습니다.');
+        }
+        
+        const video = searchResult[0];
+        const song = {
+            title: video.title,
+            url: video.url,
+            duration: video.durationInSec,
+            thumbnail: video.thumbnails[0].url,
+            requester: message.author.tag
+        };
+        
+        // 서버 큐가 없으면 생성
+        if (!serverQueue) {
+            const queueConstruct = new Queue();
+            queueConstruct.textChannel = message.channel;
+            
+            queues.set(message.guild.id, queueConstruct);
+            queueConstruct.songs.push(song);
+            
+            try {
+                // 음성 채널 연결
+                const connection = joinVoiceChannel({
+                    channelId: voiceChannel.id,
+                    guildId: message.guild.id,
+                    adapterCreator: message.guild.voiceAdapterCreator,
+                });
+                
+                queueConstruct.connection = connection;
+                
+                // 연결 상태 모니터링
+                connection.on(VoiceConnectionStatus.Disconnected, async () => {
+                    try {
+                        await Promise.race([
+                            entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+                            entersState(connection, VoiceConnectionStatus.Connecting, 5000),
+                        ]);
+                    } catch (error) {
+                        connection.destroy();
+                        queues.delete(message.guild.id);
+                    }
+                });
+                
+                // 플레이어 구독
+                connection.subscribe(queueConstruct.player);
+                
+                // 재생 시작
+                playSong(message.guild, queueConstruct.songs[0]);
+                
+            } catch (err) {
+                console.error(err);
+                queues.delete(message.guild.id);
+                return message.reply('음성 채널 연결에 실패했습니다.');
+            }
+        } else {
+            // 기존 큐에 추가
+            serverQueue.songs.push(song);
+            
+            const embed = new EmbedBuilder()
+                .setColor('#0099ff')
+                .setTitle('🎵 대기열에 추가됨')
+                .setDescription(`[${song.title}](${song.url})`)
+                .addFields(
+                    { name: '길이', value: formatDuration(song.duration), inline: true },
+                    { name: '요청자', value: song.requester, inline: true },
+                    { name: '대기열 위치', value: `${serverQueue.songs.length}번째`, inline: true }
+                )
+                .setThumbnail(song.thumbnail);
+            
+            return message.channel.send({ embeds: [embed] });
+        }
+        
+    } catch (error) {
+        console.error(error);
+        message.reply('음악을 로드하는 중 오류가 발생했습니다.');
+    }
+}
+
+// 큐에 추가만 하는 함수
+async function addToQueue(message, serverQueue) {
+    const args = message.content.split(' ');
+    
+    if (!serverQueue) {
+        return message.reply('먼저 /재생 명령어로 음악을 재생해주세요!');
+    }
+    
+    if (args.length < 2) {
+        return message.reply('검색어를 입력해주세요! 예: /추가 노래제목');
+    }
+    
+    const searchQuery = args.slice(1).join(' ');
+    
+    try {
+        const searchResult = await play.search(searchQuery, { limit: 1, source: { youtube: "video" } });
+        
+        if (!searchResult || searchResult.length === 0) {
+            return message.reply('검색 결과를 찾을 수 없습니다.');
+        }
+        
+        const video = searchResult[0];
+        const song = {
+            title: video.title,
+            url: video.url,
+            duration: video.durationInSec,
+            thumbnail: video.thumbnails[0].url,
+            requester: message.author.tag
+        };
+        
+        serverQueue.songs.push(song);
+        
+        const embed = new EmbedBuilder()
+            .setColor('#0099ff')
+            .setTitle('✅ 대기열에 추가됨')
+            .setDescription(`[${song.title}](${song.url})`)
+            .addFields(
+                { name: '길이', value: formatDuration(song.duration), inline: true },
+                { name: '요청자', value: song.requester, inline: true },
+                { name: '대기열 위치', value: `${serverQueue.songs.length}번째`, inline: true }
+            )
+            .setThumbnail(song.thumbnail);
+        
+        message.channel.send({ embeds: [embed] });
+        
+    } catch (error) {
+        console.error(error);
+        message.reply('음악을 추가하는 중 오류가 발생했습니다.');
+    }
+}
+
+// 실제 재생 함수
+async function playSong(guild, song) {
+    const serverQueue = queues.get(guild.id);
+    
+    if (!song) {
+        // 큐가 비었으면 연결 종료
+        serverQueue.connection.destroy();
+        queues.delete(guild.id);
+        return;
+    }
+    
+    try {
+        // play-dl로 스트림 생성 (고음질 설정)
+        const stream = await play.stream(song.url, {
+            quality: 3, // 0: 최저, 1: 저, 2: 고, 3: 최고
+        });
+        
+        const resource = createAudioResource(stream.stream, {
+            inputType: stream.type,
+        });
+        
+        serverQueue.currentSong = song;
+        serverQueue.isPlaying = true;
+        
+        serverQueue.player.play(resource);
+        
+        // 재생 완료 시 다음 곡으로
+        serverQueue.player.once(AudioPlayerStatus.Idle, () => {
+            serverQueue.songs.shift();
+            playSong(guild, serverQueue.songs[0]);
+        });
+        
+        // 재생 시작 알림
+        const embed = new EmbedBuilder()
+            .setColor('#00ff00')
+            .setTitle('🎶 재생 중')
+            .setDescription(`[${song.title}](${song.url})`)
+            .addFields(
+                { name: '길이', value: formatDuration(song.duration), inline: true },
+                { name: '요청자', value: song.requester, inline: true }
+            )
+            .setThumbnail(song.thumbnail);
+        
+        serverQueue.textChannel.send({ embeds: [embed] });
+        
+    } catch (error) {
+        console.error(error);
+        serverQueue.textChannel.send('재생 중 오류가 발생했습니다. 다음 곡으로 넘어갑니다.');
+        serverQueue.songs.shift();
+        playSong(guild, serverQueue.songs[0]);
+    }
+}
+
+// 스킵 함수
+async function skip(message, serverQueue) {
+    if (!message.member.voice.channel) {
+        return message.reply('음성 채널에 입장해주세요!');
+    }
+    
+    if (!serverQueue || !serverQueue.isPlaying) {
+        return message.reply('재생 중인 음악이 없습니다!');
+    }
+    
+    serverQueue.player.stop();
+    message.reply('⏭️ 다음 곡으로 넘어갑니다.');
+}
+
+if (message.content === '/일시정지') {
+    serverQueue.player.pause();
+    message.reply('⏸️ 일시정지됨');
+}
+
+if (message.content === '/재개') {
+    serverQueue.player.unpause();
+    message.reply('▶️ 재생 재개');
+}
+
+// 대기열 목록 표시
+async function showQueue(message, serverQueue) {
+    if (!serverQueue || serverQueue.songs.length === 0) {
+        return message.reply('대기열이 비어있습니다!');
+    }
+    
+    const current = serverQueue.currentSong;
+    const upcoming = serverQueue.songs.slice(1, 11); // 최대 10곡까지 표시
+    
+    let queueList = `**현재 재생 중:**\n🎵 [${current.title}](${current.url}) - ${formatDuration(current.duration)}\n요청: ${current.requester}\n\n`;
+    
+    if (upcoming.length > 0) {
+        queueList += `**다음 곡:**\n`;
+        upcoming.forEach((song, index) => {
+            queueList += `${index + 1}. [${song.title}](${song.url}) - ${formatDuration(song.duration)}\n`;
+        });
+    }
+    
+    if (serverQueue.songs.length > 11) {
+        queueList += `\n...그 외 ${serverQueue.songs.length - 11}곡`;
+    }
+    
+    const embed = new EmbedBuilder()
+        .setColor('#ff9900')
+        .setTitle('📋 현재 대기열')
+        .setDescription(queueList)
+        .setFooter({ text: `총 ${serverQueue.songs.length}곡` });
+    
+    message.channel.send({ embeds: [embed] });
+}
+
+// 현재 재생 중인 곡 정보
+async function nowPlaying(message, serverQueue) {
+    if (!serverQueue || !serverQueue.currentSong) {
+        return message.reply('재생 중인 음악이 없습니다!');
+    }
+    
+    const song = serverQueue.currentSong;
+    
+    const embed = new EmbedBuilder()
+        .setColor('#ff0099')
+        .setTitle('🎵 현재 재생 중')
+        .setDescription(`[${song.title}](${song.url})`)
+        .addFields(
+            { name: '길이', value: formatDuration(song.duration), inline: true },
+            { name: '요청자', value: song.requester, inline: true },
+            { name: '대기열', value: `${serverQueue.songs.length}곡`, inline: true }
+        )
+        .setThumbnail(song.thumbnail)
+        .setTimestamp();
+    
+    message.channel.send({ embeds: [embed] });
+}
+
+// 시간 포맷 변환 (초 -> 분:초)
+function formatDuration(seconds) {
+    const minutes = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${minutes}:${secs.toString().padStart(2, '0')}`;
+}
+
+// 메모리 사용량 감소를 위한 큐 크기 제한
+class Queue {
+    constructor() {
+        this.connection = null;
+        this.player = createAudioPlayer();
+        this.songs = [];
+        this.maxQueueSize = 50; // 최대 50곡으로 제한
+        this.isPlaying = false;
+        this.textChannel = null;
+        this.currentSong = null;
+    }
+    
+    addSong(song) {
+        if (this.songs.length >= this.maxQueueSize) {
+            return false;
+        }
+        this.songs.push(song);
+        return true;
+    }
+}
+
+// 비활성 상태에서 자동 연결 해제 (리소스 절약)
+let inactivityTimer;
+
+function resetInactivityTimer(guild) {
+    clearTimeout(inactivityTimer);
+    inactivityTimer = setTimeout(() => {
+        const serverQueue = queues.get(guild.id);
+        if (serverQueue && serverQueue.songs.length === 0) {
+            serverQueue.connection.destroy();
+            queues.delete(guild.id);
+            serverQueue.textChannel.send('비활성 상태로 음성 채널에서 나갑니다.');
+        }
+    }, 300000); // 5분
+}
+
+client.login(token);
